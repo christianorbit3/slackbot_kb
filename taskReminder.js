@@ -77,9 +77,7 @@ function projectTaskReport(spreadsheetId, channelId, disableMention = false) {
     tasksTodayOrPast.sort((a, b) => a.dueDate.getTime() - b.dueDate.getTime());
     tasksFuture.sort((a, b) => a.dueDate.getTime() - b.dueDate.getTime());
     
-    //Disable future tasks for now;
-    // const message = buildTaskSlackMessage(tasksTodayOrPast, tasksFuture, disableMention, spreadsheetId);
-    const message = buildTaskSlackMessage(tasksTodayOrPast, [], disableMention, spreadsheetId);
+    const message = buildTaskSlackMessage(tasksTodayOrPast, tasksFuture, disableMention, spreadsheetId);
 
     if (message.trim() === '') {
       Logger.log('投稿するタスクメッセージがありません。spreadsheetId: %s', spreadsheetId);
