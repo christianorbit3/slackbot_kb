@@ -1,0 +1,128 @@
+name: Deploy to Google Apps Script
+
+on:
+  # 手動でのデプロイメントを許可
+  workflow_dispatch:
+    inputs:
+      description:
+        description: 'Deployment description'
+        required: false
+        default: 'Manual deployment triggered.'
+  # pull_request (closedかつmerged) のみで自動デプロイをトリガー
+  pull_request:
+    types: [closed]
+    branches: [main]
+  # 注意: もし push でデプロイしたい場合は pull_request を削除し、
+  # push: { branches: [main] } のみにしてください。
+  # そうしないと、pull_request マージ時と main への push 時で二重にトリガーされる可能性があります。
+
+
+jobs:
+  deploy:
+    # workflow_dispatch またはマージされたプルリクエストの場合に実行
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # LTS バージョン 20 を使用
+          cache: 'npm'       # npm キャッシュを有効にして依存関係のインストールを高速化
+
+      - name: Install dependencies
+        run: npm ci # package-lock.json に基づいて依存関係をクリーンインストール
+
+      - name: Install clasp globally
+        # clasp コマンドを実行するためにグローバルインストールが必要
+        run: npm install -g @google/clasp
+
+      - name: Setup clasp credentials (from Base64 Secret)
+        # GitHub Secretsに CLASPRC_JSON_BASE64 (Base64エンコードされた.clasprc.jsonの内容) が設定されていることを前提とします。
+        # Base64デコードして ~/.clasprc.json に書き出します。
+        run: |
+          echo "${{ secrets.CLASPRC_JSON_BASE64 }}" | base64 -d > ~/.clasprc.json
+
+      - name: Determine deployment description
+        id: set-desc # 後続ステップで出力を参照するためにIDを付与
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "desc=${{ github.event.inputs.description }}" >> "$GITHUB_OUTPUT"
+          else
+            # PRマージ時の自動デプロイの場合、PR番号とタイトルを説明に含める
+            echo "desc=Auto deployment from PR #${{ github.event.pull_request.number }} (${{ github.event.pull_request.title }})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push code to Google Apps Script
+        # ローカルのコードをGASプロジェクト（スクリプトエディタの内容）に同期する
+        run: |
+          set -e # コマンドが失敗した場合、すぐにスクリプトを終了
+          npx clasp push
+
+      - name: Create new version
+        id: create-version # 作成されたバージョン番号を取得するためにIDを付与
+        run: |
+          set -e
+          VERSION_DESCRIPTION="${{ steps.set-desc.outputs.desc }}"
+
+          # clasp version コマンドの出力をパースしてバージョン番号を取得
+          # 出力例: "Created version 130" （前回エラーログで確認済み）
+          VERSION_OUTPUT=$(npx clasp version "${VERSION_DESCRIPTION}")
+          echo "Clasp Version Output: $VERSION_OUTPUT" # デバッグ用としてログに出力
+
+          # "Created version XXX" から XXX を抽出する正規表現
+          VERSION_NUMBER=$(echo "$VERSION_OUTPUT" | sed -n 's/^Created version \([0-9]\+\)$/\1/p')
+
+          if [ -z "$VERSION_NUMBER" ]; then
+            echo "::error::Failed to extract version number from clasp output. Please check clasp version command output format."
+            exit 1 # バージョン番号が取得できない場合はエラーで終了
+          fi
+          echo "version_number=$VERSION_NUMBER" >> "$GITHUB_OUTPUT" # 後続ステップで利用できるよう出力
+          echo "Created new version: $VERSION_NUMBER with description: $VERSION_DESCRIPTION"
+
+      - name: Deploy to Google Apps Script (Update existing Web App/API Executable)
+        # 既存のデプロイメント（WebアプリやAPI実行可能URLなど）を、新しく作成したバージョンに更新する
+        run: |
+          set -e
+          DESC="${{ steps.set-desc.outputs.desc }}"
+          VERSION_TO_DEPLOY="${{ steps.create-version.outputs.version_number }}" # 直前で作成したバージョン番号を取得
+
+          # GitHub SecretsからWebアプリのデプロイメントIDを取得
+          # この Secret が設定されていない場合、警告が出力され、既存のWebアプリURLは更新されない
+          # WebアプリのデプロイIDは GASエディタの「デプロイ」->「デプロイを管理」で確認できます
+          DEPLOYMENT_ID="${{ secrets.GAS_WEBAPP_DEPLOYMENT_ID }}" 
+
+          if [ -z "$DEPLOYMENT_ID" ]; then
+            echo "::warning::GAS_WEBAPP_DEPLOYMENT_ID secret is not set. Cannot update a specific existing deployment."
+            echo "This workflow will create a new 'Head' deployment if no specific deploymentId is provided."
+            echo "To update your existing Web App URL, please set GAS_WEBAPP_DEPLOYMENT_ID secret."
+            # 特定のデプロイメントIDがない場合は、デフォルトのデプロイ（通常は最新コードを指すHEADデプロイ）
+            # これだと、既存のWebアプリURLは更新されない点に注意
+            npx clasp deploy --description "$DESC"
+          else
+            echo "Updating existing deployment: $DEPLOYMENT_ID to version $VERSION_TO_DEPLOY"
+            # 既存のデプロイメントIDを指定し、新しいバージョンを紐づける
+            npx clasp deploy --deploymentId "$DEPLOYMENT_ID" --version "$VERSION_TO_DEPLOY" --description "$DESC"
+          fi
+
+      - name: Show current deployments
+        # 現在のデプロイメントの一覧を表示し、デバッグに役立てる
+        run: npx clasp deployments
+
+      - name: Notify deployment success
+        # デプロイ成功の通知と、GASプロジェクトへの直接リンクを表示
+        run: |
+          echo "✅ Deployment completed successfully!"
+          # .clasp.json から scriptId を直接取得してGASプロジェクトURLを生成
+          # grep と sed を使ってスクリプトIDを抽出
+          SCRIPT_ID=$(grep '"scriptId":' .clasp.json | head -n 1 | sed 's/.*"scriptId": "\(.*\)".*/\1/')
+
+          if [ -n "$SCRIPT_ID" ]; then
+            echo "🔗 View your GAS project: https://script.google.com/d/${SCRIPT_ID}/edit"
+          else
+            echo "🔗 View your GAS project: https://script.google.com"
+            echo "⚠️ Could not determine Script ID. Please check .clasp.json."
+          fi 
